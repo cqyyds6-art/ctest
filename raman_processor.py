@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -121,6 +120,41 @@ class RamanProcessorApp:
             return pd.Series([0.0] * len(series), index=series.index)
         return (series - minimum) / (maximum - minimum) * 100
 
+    @staticmethod
+    def _load_single_point_data(file_path: str) -> tuple[pd.Series, pd.Series]:
+        """读取单点谱图，失败时抛出 ValueError。"""
+        data = pd.read_csv(file_path, sep="\t", header=None, names=["W", "I"])
+        if data.shape[1] < 2 or data.empty:
+            raise ValueError("empty or invalid spectrum file")
+
+        try:
+            x_data = pd.to_numeric(data["W"], errors="raise")
+            y_data = pd.to_numeric(data["I"], errors="raise")
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("non-numeric Raman data") from exc
+
+        return x_data, y_data
+
+    @staticmethod
+    def _parse_mapping_waves(header_line: str) -> pd.Series:
+        waves = [w for w in header_line.strip().split("\t") if w]
+        if not waves:
+            raise ValueError("mapping header has no wave numbers")
+        return pd.to_numeric(pd.Series(waves), errors="raise")
+
+    @staticmethod
+    def _parse_mapping_point(parts: list[str], waves: pd.Series) -> tuple[float, float, pd.DataFrame]:
+        if len(parts) < 3:
+            raise ValueError("mapping row is too short")
+        if len(parts) - 2 != len(waves):
+            raise ValueError("mapping row length mismatch")
+
+        y_val = float(parts[0])
+        x_val = float(parts[1])
+        intensity = pd.to_numeric(pd.Series(parts[2:]), errors="raise")
+        df = pd.DataFrame({"W": waves, "I": intensity})
+        return y_val, x_val, df
+
     def apply_plot_style(
         self,
         ax: plt.Axes,
@@ -178,10 +212,12 @@ class RamanProcessorApp:
             if do_graphene and "G" in peak_info:
                 g = peak_info["G"]
                 results = []
-                if "D" in peak_info:
+                if g != 0 and "D" in peak_info:
                     results.append(f"ID/IG: {peak_info['D'] / g:.3f}")
-                if "2D" in peak_info:
+                if g != 0 and "2D" in peak_info:
                     results.append(f"I2D/IG: {peak_info['2D'] / g:.3f}")
+                if g == 0:
+                    results.append("ID/IG: N/A (G peak is 0)")
                 if results:
                     ax.text(
                         0.05,
@@ -273,6 +309,7 @@ class RamanProcessorApp:
         pb.pack(pady=20)
 
         skipped: list[str] = []
+        failed: list[str] = []
         processed_count = 0
 
         for i, fpath in enumerate(files):
@@ -283,13 +320,13 @@ class RamanProcessorApp:
                     skipped.append(Path(fpath).name)
                     continue
 
-                data = pd.read_csv(fpath, sep="\t", header=None, names=["W", "I"])
-                plot_y = self._normalize(data["I"]) if options.normalize else data["I"]
+                x_data, y_data = self._load_single_point_data(fpath)
+                plot_y = self._normalize(y_data) if options.normalize else y_data
                 base = Path(fpath).with_suffix("")
 
                 if options.save_plot:
                     fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
-                    self.apply_plot_style(ax, data["W"], plot_y, options.normalize, options.peak_labeling, options.graphene_calc)
+                    self.apply_plot_style(ax, x_data, plot_y, options.normalize, options.peak_labeling, options.graphene_calc)
                     fig.savefig(str(base) + "_Plot.png", bbox_inches="tight")
                     plt.close(fig)
 
@@ -299,13 +336,14 @@ class RamanProcessorApp:
                         fig_c, (ax_i, ax_s) = plt.subplots(2, 1, figsize=(8, 10), dpi=200)
                         ax_i.imshow(mpimg.imread(image_path))
                         ax_i.axis("off")
-                        self.apply_plot_style(ax_s, data["W"], plot_y, options.normalize, options.peak_labeling, options.graphene_calc)
+                        self.apply_plot_style(ax_s, x_data, plot_y, options.normalize, options.peak_labeling, options.graphene_calc)
                         fig_c.savefig(str(base) + "_Combined.png", bbox_inches="tight")
                         plt.close(fig_c)
 
                 processed_count += 1
             except Exception as exc:  # noqa: BLE001
                 print(f"Error skipping {fpath}: {exc}")
+                failed.append(Path(fpath).name)
             finally:
                 pb["value"] = i + 1
                 prog_win.update()
@@ -315,6 +353,8 @@ class RamanProcessorApp:
         report = f"Successfully processed {processed_count} files."
         if skipped:
             report += f"\n\nSkipped {len(skipped)} Mapping files (use Mode B instead):\n" + "\n".join(skipped[:5])
+        if failed:
+            report += f"\n\nFailed {len(failed)} files due to parse/data errors:\n" + "\n".join(failed[:5])
         messagebox.showinfo("Batch Result", report)
 
     def setup_mapping(self, pre_file: str | None = None) -> None:
@@ -398,8 +438,9 @@ class RamanProcessorApp:
     def process_mapping(self, map_file: str, options: MappingOptions) -> None:
         img_path: str | None = None
         calibration = None
+        enable_overlay = options.generate_overlay
 
-        if options.generate_overlay:
+        if enable_overlay:
             base = Path(map_file).with_suffix("")
             candidate = self._find_related_image(base)
             if candidate is None:
@@ -412,7 +453,7 @@ class RamanProcessorApp:
             if img_path:
                 calibration = self.calibrate_image(img_path)
             if calibration is None:
-                options.generate_overlay = False
+                enable_overlay = False
 
         output_dir = Path(map_file).parent / (Path(map_file).stem + "_Results")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -420,18 +461,34 @@ class RamanProcessorApp:
         with open(map_file, "r", encoding="utf-8") as file:
             lines = file.readlines()
 
-        waves = [w for w in lines[0].strip().split("\t") if w]
+        if len(lines) < 2:
+            messagebox.showerror("Error", "Mapping file has no data rows.")
+            return
+
+        try:
+            waves = self._parse_mapping_waves(lines[0])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Error", f"Invalid mapping header: {exc}")
+            return
 
         prog = tk.Toplevel(self.root)
         self.center_window(prog, 400, 100)
         pb = ttk.Progressbar(prog, length=300, maximum=len(lines) - 1)
         pb.pack(pady=20)
-        img_data = mpimg.imread(img_path) if img_path and options.generate_overlay else None
+        img_data = mpimg.imread(img_path) if img_path and enable_overlay else None
+        failed_rows = 0
 
         for i in range(1, len(lines)):
             parts = lines[i].strip().split("\t")
-            y_val, x_val = float(parts[0]), float(parts[1])
-            df = pd.DataFrame({"W": waves, "I": parts[2:]}).astype(float)
+            try:
+                y_val, x_val, df = self._parse_mapping_point(parts, waves)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Skipping row {i}: {exc}")
+                failed_rows += 1
+                pb["value"] = i
+                prog.update()
+                continue
+
             plot_y = self._normalize(df["I"]) if options.normalize else df["I"]
             prefix = f"Point_{i}_X{x_val}_Y{y_val}"
 
@@ -443,7 +500,7 @@ class RamanProcessorApp:
                     fig.savefig(output_dir / f"{prefix}_Plot.png", bbox_inches="tight")
                     plt.close(fig)
 
-            if options.generate_overlay and calibration:
+            if enable_overlay and calibration:
                 s_x, o_x, s_y, o_y = calibration
                 px, py = x_val * s_x + o_x, y_val * s_y + o_y
 
@@ -461,7 +518,10 @@ class RamanProcessorApp:
             prog.update()
 
         prog.destroy()
-        messagebox.showinfo("Success", "Mapping process completed.")
+        summary = "Mapping process completed."
+        if failed_rows:
+            summary += f"\nSkipped malformed rows: {failed_rows}"
+        messagebox.showinfo("Success", summary)
 
     def run(self) -> None:
         self.root.mainloop()
